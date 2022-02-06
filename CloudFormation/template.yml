@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Test DynamoDB table with streams to use with ElasticSearch
+
+Transform: 'AWS::Serverless-2016-10-31'
+
+Resources:
+  
+  #-----------------DynamoDB
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "CloudNativeDAM_DB"
+      AttributeDefinitions:
+        -
+          AttributeName: "ID"
+          AttributeType: "S"
+        -
+          AttributeName: "SK"
+          AttributeType: "S"
+        -
+          AttributeName: "Data"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "ID"
+          KeyType: "HASH"
+        -
+          AttributeName: "SK"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "1"
+        WriteCapacityUnits: "1"
+      GlobalSecondaryIndexes:
+        -
+          IndexName: "Data-index"
+          KeySchema:
+            -
+              AttributeName: "Data"
+              KeyType: "HASH"
+            -
+              AttributeName: "SK"
+              KeyType: "RANGE"
+          Projection:
+            ProjectionType: "ALL"
+          ProvisionedThroughput:
+            ReadCapacityUnits: "1"
+            WriteCapacityUnits: "1"
+        -
+          IndexName: "File-Clusters-index"
+          KeySchema:
+            -
+              AttributeName: "SK"
+              KeyType: "HASH"
+            -
+              AttributeName: "ID"
+              KeyType: "RANGE"
+          Projection:
+            ProjectionType: "ALL"
+          ProvisionedThroughput:
+            ReadCapacityUnits: "1"
+            WriteCapacityUnits: "1"
+      StreamSpecification:
+        StreamViewType: "NEW_IMAGE"
+
+
+
+
+  #-----------------LAMBDA FUNCTIONS
+  MyLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt FunctionExecutionRole.Arn
+      Handler: DynamodDbToOpenSearch.handler
+      CodeUri: ../Lambdas/DynamodbStreams/DynamodDbToOpenSearch.py
+      Layers:
+        - !Ref OpenSearchLayer
+      Environment:
+         Variables: 
+          openSearchServiceDomain : !GetAtt OpenSearchService.DomainEndpoint
+  
+  OpenSearchApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt OpenSearchApiExecutionRole.Arn
+      Handler: OpenSearchApiFunction.handler
+      CodeUri: ../Lambdas/OpenSearchApi/OpenSearchApiFunction.py
+      Layers:
+        - !Ref OpenSearchLayer
+      Environment:
+         Variables: 
+          openSearchServiceDomain : !GetAtt OpenSearchService.DomainEndpoint
+
+  OpenSearchLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: open-search-layer
+      Description: requests and aws signing libs
+      ContentUri: ../Lambdas/openSearchLayer.zip
+
+  DynamoDbStreamTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      BatchSize: 1 #100
+      EventSourceArn: !GetAtt DynamoDBTable.StreamArn
+      FunctionName: !GetAtt MyLambdaFunction.Arn
+      StartingPosition: "TRIM_HORIZON"
+
+
+
+  #---------------------------------Open Search
+  OpenSearchService:
+    Type: AWS::OpenSearchService::Domain
+    Properties: 
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Principal: "*"
+            Action: 'es:*'
+            Condition:
+              IpAddress:
+                "aws:SourceIp": "<user IP for test purposes>/32"
+      ClusterConfig: 
+        InstanceCount: 1
+        InstanceType: t2.small.search
+        ZoneAwarenessEnabled: false
+      EBSOptions: 
+        EBSEnabled: true
+        VolumeType: "standard"
+        VolumeSize: 10
+
+
+
+  #--------------------------------Roles-----------------------------------
+  
+  LambdaOpenSearchPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - es:ESHttpPost
+              - es:ESHttpPut
+              - dynamodb:DescribeStream
+              - dynamodb:GetRecords
+              - dynamodb:GetShardIterator
+              - dynamodb:ListStreams
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - "*"
+
+  FunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref LambdaOpenSearchPolicy
+
+
+  LambdaOpenSearchPolicyApi:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - es:ESHttpPost
+              - es:ESHttpGet
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub '${OpenSearchService.Arn}/*'
+
+  OpenSearchApiExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref LambdaOpenSearchPolicyApi
+
